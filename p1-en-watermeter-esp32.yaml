@@ -8,6 +8,8 @@ substitutions:
   domoticz_idx_water_2: "2154"
   domoticz_idx_valve: "2044"
   domoticz_idx_rssi: "1587"
+  # Rate limiting
+  domoticz_p1_interval_ms: "10000"  # 10 seconds, change to 60000 for 1 minute
 
 esphome:
   name: ${name}
@@ -90,26 +92,36 @@ dsmr:
 # ============================================================
 # Scripts
 # ============================================================
+globals:
+  - id: last_p1_send
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
 script:
   - id: send_domoticz_p1
-    mode: queued
+    mode: single
     then:
-      - mqtt.publish_json:
-          topic: "domoticz/in"
-          payload: |-
-            root["command"] = "udevice";
-            root["idx"] = ${domoticz_idx_p1};
-            char svalue[128];
-            sprintf(svalue, "%.0f;%.0f;%.0f;%.0f;%.0f;%.0f",
-              id(e_cons_t1).state * 1000.0,
-              id(e_cons_t2).state * 1000.0,
-              id(e_prod_t1).state * 1000.0,
-              id(e_prod_t2).state * 1000.0,
-              id(p_cons).state * 1000.0,    // FIX: kW → W
-              id(p_prod).state * 1000.0     // FIX: kW → W
-            );
-            root["svalue"] = svalue;
-
+      - if:
+          condition:
+            lambda: 'return (millis() - id(last_p1_send)) > ${domoticz_p1_interval_ms};'
+          then:
+            - lambda: 'id(last_p1_send) = millis();'
+            - mqtt.publish_json:
+                topic: "domoticz/in"
+                payload: |-
+                  root["command"] = "udevice";
+                  root["idx"] = ${domoticz_idx_p1};
+                  char svalue[128];
+                  sprintf(svalue, "%.0f;%.0f;%.0f;%.0f;%.0f;%.0f",
+                    id(e_cons_t1).state * 1000.0,
+                    id(e_cons_t2).state * 1000.0,
+                    id(e_prod_t1).state * 1000.0,
+                    id(e_prod_t2).state * 1000.0,
+                    id(p_cons).state * 1000.0,
+                    id(p_prod).state * 1000.0
+                  );
+                  root["svalue"] = svalue;
 # ============================================================
 # Sensors
 # ============================================================
@@ -179,6 +191,8 @@ sensor:
       name: "Gas Consumed"
       id: gas_cons
       state_class: total_increasing
+      filters:
+        - delta: 0.001  # only update if changed by at least 1 liter (0.001 m³)
       on_value:
         then:
           - mqtt.publish_json:
@@ -187,9 +201,8 @@ sensor:
                 root["command"] = "udevice";
                 root["idx"] = ${domoticz_idx_gas};
                 char svalue[32];
-                sprintf(svalue, "%.3f", id(gas_cons).state);
+                sprintf(svalue, "%.0f", id(gas_cons).state * 1000.0);
                 root["svalue"] = svalue;
-
   # ----------------------------------------------------------
   # Water meter — 1 pulse = 1 liter
   # ----------------------------------------------------------
@@ -203,7 +216,7 @@ sensor:
     state_class: measurement
     timeout: 10s
     filters:
-      - heartbeat: 5s
+      - delta: 0.001  # only publish when flow actually changes
     total:
       name: "Total Water Consumed"
       id: total_water
