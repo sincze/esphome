@@ -1,0 +1,313 @@
+substitutions:
+  name: smartmeter-p1-reader
+  friendly_name: P1 en Watermeter
+  # Domoticz IDX values
+  domoticz_idx_p1: "168"
+  domoticz_idx_gas: "169"
+  domoticz_idx_water_1: "1361"
+  domoticz_idx_water_2: "2154"
+  domoticz_idx_valve: "2044"
+  domoticz_idx_rssi: "1587"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  comment: "MH-ET Live Mini Kit ESP32 - Smartmeter P1 & Water reader"
+  on_boot:
+    priority: -10
+    then:
+      - switch.turn_off: p1_enable_pin
+      - logger.log:
+          level: INFO
+          format: "OE_DATA_REQ set LOW - SN74HC125N buffer enabled"
+
+esp32:
+  board: wemos_d1_mini32
+  framework:
+    type: arduino
+
+# Logger on UART2 (GPIO16/17) to free GPIO1/GPIO3 for P1 UART
+logger:
+  level: DEBUG
+  baud_rate: 115200
+  hardware_uart: UART2
+
+api:
+  encryption:
+    key: "xxxxx="
+
+ota:
+  - platform: esphome
+    password: "xxxxx"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA2
+  fast_connect: true      # FIX: was true, can deadlock on channel change
+  power_save_mode: none
+  reboot_timeout: 60s
+
+# ============================================================
+# MQTT
+# ============================================================
+mqtt:
+  broker: "mqtt.home.lan"
+  discovery: true
+  discovery_prefix: homeassistant
+
+# ============================================================
+# SN74HC125N buffer enable (OE pin = active LOW)
+# ============================================================
+switch:
+  - platform: gpio
+    pin: GPIO18
+    id: p1_enable_pin
+    name: "P1 Buffer Enable"
+    inverted: false
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+# ============================================================
+# UART for P1 DSMR telegrams
+# ============================================================
+uart:
+  - id: uart_p1
+    rx_pin: GPIO1
+    tx_pin: GPIO3
+    baud_rate: 115200
+    data_bits: 8
+    parity: NONE
+    stop_bits: 1
+    rx_buffer_size: 2048
+
+# DSMR decoder — DSMR 5.0 ZIV meter
+dsmr:
+  id: dsmr_meter
+  uart_id: uart_p1
+  max_telegram_length: 8192
+
+# ============================================================
+# Scripts
+# ============================================================
+script:
+  - id: send_domoticz_p1
+    mode: queued
+    then:
+      - mqtt.publish_json:
+          topic: "domoticz/in"
+          payload: |-
+            root["command"] = "udevice";
+            root["idx"] = ${domoticz_idx_p1};
+            char svalue[128];
+            sprintf(svalue, "%.0f;%.0f;%.0f;%.0f;%.0f;%.0f",
+              id(e_cons_t1).state * 1000.0,
+              id(e_cons_t2).state * 1000.0,
+              id(e_prod_t1).state * 1000.0,
+              id(e_prod_t2).state * 1000.0,
+              id(p_cons).state * 1000.0,    // FIX: kW → W
+              id(p_prod).state * 1000.0     // FIX: kW → W
+            );
+            root["svalue"] = svalue;
+
+# ============================================================
+# Sensors
+# ============================================================
+sensor:
+
+  # ----------------------------------------------------------
+  # DSMR / P1 smart meter
+  # ----------------------------------------------------------
+  - platform: dsmr
+    energy_delivered_tariff1:
+      name: "Energy Consumed Tariff 1"
+      id: e_cons_t1
+      state_class: total_increasing
+    energy_delivered_tariff2:
+      name: "Energy Consumed Tariff 2"
+      id: e_cons_t2
+      state_class: total_increasing
+    energy_returned_tariff1:
+      name: "Energy Produced Tariff 1"
+      id: e_prod_t1
+      state_class: total_increasing
+    energy_returned_tariff2:
+      name: "Energy Produced Tariff 2"
+      id: e_prod_t2
+      state_class: total_increasing
+    power_returned:
+      name: "Current Power Production"
+      id: p_prod
+      on_value:
+        then:
+          - script.execute: send_domoticz_p1
+    power_delivered:
+      name: "Current Power Usage"
+      id: p_cons
+      on_value:
+        then:
+          - script.execute: send_domoticz_p1
+
+    voltage_l1:
+      name: "Voltage L1"
+    current_l1:
+      name: "Current L1"
+    power_delivered_l1:
+      name: "Power Consumed L1"
+    power_returned_l1:
+      name: "Power Produced L1"
+
+    voltage_l2:
+      name: "Voltage L2"
+    current_l2:
+      name: "Current L2"
+    power_delivered_l2:
+      name: "Power Consumed L2"
+    power_returned_l2:
+      name: "Power Produced L2"
+
+    voltage_l3:
+      name: "Voltage L3"
+    current_l3:
+      name: "Current L3"
+    power_delivered_l3:
+      name: "Power Consumed L3"
+    power_returned_l3:
+      name: "Power Produced L3"
+
+    gas_delivered:
+      name: "Gas Consumed"
+      id: gas_cons
+      state_class: total_increasing
+      on_value:
+        then:
+          - mqtt.publish_json:
+              topic: "domoticz/in"
+              payload: |-
+                root["command"] = "udevice";
+                root["idx"] = ${domoticz_idx_gas};
+                char svalue[32];
+                sprintf(svalue, "%.3f", id(gas_cons).state);
+                root["svalue"] = svalue;
+
+  # ----------------------------------------------------------
+  # Water meter — 1 pulse = 1 liter
+  # ----------------------------------------------------------
+  - platform: pulse_meter
+    pin:
+      number: GPIO23
+      mode: INPUT_PULLUP
+    name: "Water Flow Rate"
+    id: water_flow
+    unit_of_measurement: "L/min"
+    state_class: measurement
+    timeout: 10s
+    filters:
+      - heartbeat: 5s
+    total:
+      name: "Total Water Consumed"
+      id: total_water
+      unit_of_measurement: "L"
+      state_class: total_increasing
+      device_class: water
+      on_value:
+        then:
+          - mqtt.publish_json:
+              topic: "domoticz/in"
+              payload: |-
+                root["command"] = "udevice";
+                root["idx"] = ${domoticz_idx_water_1};
+                char svalue[32];
+                sprintf(svalue, "%.0f", id(total_water).state);  // send liters as integer
+                root["svalue"] = svalue;
+          - mqtt.publish_json:
+              topic: "domoticz/in"
+              payload: |-
+                root["command"] = "udevice";
+                root["idx"] = ${domoticz_idx_water_2};
+                char svalue[32];
+                sprintf(svalue, "%.0f", id(total_water).state);  // send liters as integer
+                root["svalue"] = svalue;
+
+  # ----------------------------------------------------------
+  # ESP32 diagnostics
+  # ----------------------------------------------------------
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+
+  - platform: wifi_signal
+    name: "WiFi RSSI"
+    id: wifi_rssi
+    update_interval: 60s
+
+  - platform: template
+    name: "Free Heap"
+    lambda: 'return esp_get_free_heap_size();'
+    unit_of_measurement: "B"
+    update_interval: 60s
+    icon: "mdi:memory"
+
+# ============================================================
+# Text sensors
+# ============================================================
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+    ssid:
+      name: "Connected SSID"
+    mac_address:
+      name: "MAC Address"
+
+# ============================================================
+# Binary sensors
+# ============================================================
+binary_sensor:
+  # Internal: filtered state with 60s delayed_off
+  - platform: template
+    id: valve_status_raw
+    internal: true
+    lambda: |-
+      if (!id(water_flow).has_state() || isnan(id(water_flow).state)) {
+        return false;
+      }
+      return id(water_flow).state > 0;
+    filters:
+      - delayed_off: 60s
+    on_state:
+      then:
+        - if:
+            condition:
+              binary_sensor.is_on: valve_status_raw
+            then:
+              - mqtt.publish:
+                  topic: "domoticz/in"
+                  payload: '{"command": "switchlight", "idx": ${domoticz_idx_valve}, "switchcmd": "On"}'
+            else:
+              - mqtt.publish:
+                  topic: "domoticz/in"
+                  payload: '{"command": "switchlight", "idx": ${domoticz_idx_valve}, "switchcmd": "Off"}'
+
+  # Public: exposes the filtered state to HA
+  - platform: template
+    name: "Valve Status"
+    id: valve_status
+    device_class: moisture
+    lambda: |-
+      return id(valve_status_raw).state;
+
+# ============================================================
+# RSSI to Domoticz every 5 minutes
+# ============================================================
+interval:
+  - interval: 5min
+    then:
+      - mqtt.publish_json:
+          topic: "domoticz/in"
+          payload: |-
+            root["command"] = "udevice";
+            root["idx"] = ${domoticz_idx_rssi};
+            char svalue[16];
+            sprintf(svalue, "%.0f", id(wifi_rssi).state);
+            root["svalue"] = svalue;
