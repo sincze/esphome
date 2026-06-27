@@ -90,7 +90,7 @@ dsmr:
   max_telegram_length: 8192
 
 # ============================================================
-# Scripts
+# Globals
 # ============================================================
 globals:
   - id: last_p1_send
@@ -98,6 +98,9 @@ globals:
     restore_value: no
     initial_value: '0'
 
+# ============================================================
+# Scripts
+# ============================================================
 script:
   - id: send_domoticz_p1
     mode: single
@@ -122,6 +125,7 @@ script:
                     id(p_prod).state * 1000.0
                   );
                   root["svalue"] = svalue;
+
 # ============================================================
 # Sensors
 # ============================================================
@@ -203,44 +207,46 @@ sensor:
                 char svalue[32];
                 sprintf(svalue, "%.0f", id(gas_cons).state * 1000.0);
                 root["svalue"] = svalue;
+
   # ----------------------------------------------------------
-  # Water meter — 1 pulse = 1 liter
+  # Water meter core — 1 pulse = 1 liter
   # ----------------------------------------------------------
   - platform: pulse_meter
     pin:
       number: GPIO23
       mode: INPUT_PULLUP
-    name: "Water Flow Rate"
+    name: "Water Flow Rate Raw"
     id: water_flow
     unit_of_measurement: "L/min"
     state_class: measurement
     timeout: 10s
-    filters:
-      - delta: 0.001  # only publish when flow actually changes
+    internal: false  # Kept visible so Home Assistant still gets instant flow metrics
     total:
       name: "Total Water Consumed"
       id: total_water
       unit_of_measurement: "L"
       state_class: total_increasing
       device_class: water
-      on_value:
-        then:
-          - mqtt.publish_json:
-              topic: "domoticz/in"
-              payload: |-
-                root["command"] = "udevice";
-                root["idx"] = ${domoticz_idx_water_1};
-                char svalue[32];
-                sprintf(svalue, "%.0f", id(total_water).state);  // send liters as integer
-                root["svalue"] = svalue;
-          - mqtt.publish_json:
-              topic: "domoticz/in"
-              payload: |-
-                root["command"] = "udevice";
-                root["idx"] = ${domoticz_idx_water_2};
-                char svalue[32];
-                sprintf(svalue, "%.0f", id(total_water).state);  // send liters as integer
-                root["svalue"] = svalue;
+
+  # ----------------------------------------------------------
+  # Template Sensor to calculate pulses in the last minute
+  # ----------------------------------------------------------
+  - platform: template
+    name: "Water Pulses Per Minute"
+    id: water_pulses_per_min
+    unit_of_measurement: "pulses"
+    update_interval: never  # Controlled entirely by our 1-minute interval below
+    lambda: |-
+      static float last_total = 0.0;
+      float current_total = id(total_water).state;
+
+      if (current_total < last_total) {
+        last_total = current_total;
+      }
+
+      float pulses_this_minute = current_total - last_total;
+      last_total = current_total;
+      return pulses_this_minute;
 
   # ----------------------------------------------------------
   # ESP32 diagnostics
@@ -261,6 +267,33 @@ sensor:
     update_interval: 60s
     icon: "mdi:memory"
 
+  # ----------------------------------------------------------
+  # Human-readable uptime tracker
+  # ----------------------------------------------------------
+  - platform: uptime
+    name: "${friendly_name} Uptime Raw"
+    id: uptime_sensor_days
+    update_interval: 60s
+    internal: true
+    on_raw_value:
+      then:
+        - text_sensor.template.publish:
+            id: uptime_human
+            state: !lambda |-
+              int seconds = round(id(uptime_sensor_days).get_raw_state());
+              int days = seconds / (24 * 3600);
+              seconds = seconds % (24 * 3600);
+              int hours = seconds / 3600;
+              seconds = seconds % 3600;
+              int minutes = seconds / 60;
+              seconds = seconds % 60;
+              return (
+                (days ? String(days) + "d " : "") +
+                (hours ? String(hours) + "h " : "") +
+                (minutes ? String(minutes) + "m " : "") +
+                (String(seconds) + "s")
+              ).c_str();
+
 # ============================================================
 # Text sensors
 # ============================================================
@@ -273,11 +306,15 @@ text_sensor:
     mac_address:
       name: "MAC Address"
 
+  - platform: template
+    name: "Uptime Readable"
+    id: uptime_human
+    icon: "mdi:clock-start"
+
 # ============================================================
-# Binary sensors
+# Binary sensors (Instant Valve Detection for HA & Domoticz)
 # ============================================================
 binary_sensor:
-  # Internal: filtered state with 60s delayed_off
   - platform: template
     id: valve_status_raw
     internal: true
@@ -287,7 +324,7 @@ binary_sensor:
       }
       return id(water_flow).state > 0;
     filters:
-      - delayed_off: 60s
+      - delayed_off: 10s  # Matches the pulse_meter timeout for snappy execution
     on_state:
       then:
         - if:
@@ -302,7 +339,6 @@ binary_sensor:
                   topic: "domoticz/in"
                   payload: '{"command": "switchlight", "idx": ${domoticz_idx_valve}, "switchcmd": "Off"}'
 
-  # Public: exposes the filtered state to HA
   - platform: template
     name: "Valve Status"
     id: valve_status
@@ -311,9 +347,41 @@ binary_sensor:
       return id(valve_status_raw).state;
 
 # ============================================================
-# RSSI to Domoticz every 5 minutes
+# Intervals
 # ============================================================
 interval:
+  # 1-Minute Water Aggregator and Dual MQTT Dispatch
+  - interval: 1min
+    then:
+      - component.update: water_pulses_per_min
+
+      # IDX 1361 — Waterflow: ALWAYS send current l/min (no gating)
+      # Domoticz needs a fresh value every minute including 0.0 when idle
+      - mqtt.publish_json:
+          topic: "domoticz/in"
+          payload: |-
+            root["command"] = "udevice";
+            root["idx"] = ${domoticz_idx_water_1};
+            char svalue[32];
+            sprintf(svalue, "%.1f", id(water_pulses_per_min).state);
+            root["svalue"] = svalue;
+
+      # IDX 2154 — Counter Incremental: only send when there's something to add
+      # Sending 0 delta is harmless but unnecessary — skip it to keep history clean
+      - if:
+          condition:
+            lambda: 'return id(water_pulses_per_min).state > 0;'
+          then:
+            - mqtt.publish_json:
+                topic: "domoticz/in"
+                payload: |-
+                  root["command"] = "udevice";
+                  root["idx"] = ${domoticz_idx_water_2};
+                  char svalue[32];
+                  sprintf(svalue, "%.0f", id(water_pulses_per_min).state);
+                  root["svalue"] = svalue;
+
+  # RSSI to Domoticz every 5 minutes
   - interval: 5min
     then:
       - mqtt.publish_json:
@@ -324,3 +392,10 @@ interval:
             char svalue[16];
             sprintf(svalue, "%.0f", id(wifi_rssi).state);
             root["svalue"] = svalue;
+
+# ============================================================
+# Time Component
+# ============================================================
+time:
+  - platform: homeassistant
+    id: homeassistant_time
